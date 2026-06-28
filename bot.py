@@ -177,15 +177,13 @@ async def check_telegram(username: str, token: str) -> Optional[bool]:
 
 async def check_fragment(username: str) -> dict:
     """
-    Возвращает dict:
-      {
-        'status': 'free' | 'on_sale' | 'sold' | 'unknown',
-        'price':  '1 234 TON' | None,   # если on_sale
-        'url':    'https://fragment.com/username/xxx'
-      }
+    Возвращает {'status': 'free' | 'sold' | 'unknown', 'url': str}.
+    free  — 404, ника нет на Fragment.
+    sold  — любой другой ответ (продан или продаётся — неважно, занят).
+    unknown — ошибка сети.
     """
     url = f"https://fragment.com/username/{username.lower()}"
-    result = {"status": "unknown", "price": None, "url": url}
+    result = {"status": "unknown", "url": url}
 
     try:
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
@@ -194,52 +192,16 @@ async def check_fragment(username: str) -> dict:
                 "Accept": "text/html,application/xhtml+xml"
             })
 
+        # 404 — точно нет на Fragment, свободен
         if r.status_code == 404:
             result["status"] = "free"
             return result
 
-        text = r.text
-        text_low = text.lower()
-
-        # Продан
-        if "sold" in text_low and "username" in text_low:
-            result["status"] = "sold"
-            return result
-
-        # На продаже — извлекаем цену
-        sale_keywords = ["place a bid", "buy now", "auction", "minimum bid", "make an offer"]
-        if any(w in text_low for w in sale_keywords):
-            result["status"] = "on_sale"
-
-            # Пробуем вытащить цену (TON)
-            price_match = re.search(
-                r'([\d\s,]+)\s*(?:ton|💎)',
-                text,
-                re.IGNORECASE
-            )
-            if not price_match:
-                # Альтернативный паттерн: числа рядом с TON в JSON/data
-                price_match = re.search(
-                    r'"price"\s*:\s*"?([\d.,]+)"?',
-                    text,
-                    re.IGNORECASE
-                )
-            if price_match:
-                raw = price_match.group(1).replace(" ", "").replace(",", "")
-                try:
-                    tons = int(float(raw))
-                    result["price"] = f"{tons:,} TON".replace(",", " ")
-                except ValueError:
-                    pass
-
-            return result
-
-        if r.status_code == 200:
-            result["status"] = "sold"
-            return result
-
-        result["status"] = "free"
+        # Любой другой статус — ник существует на Fragment (продан или продаётся).
+        # В обоих случаях не показываем — занят.
+        result["status"] = "sold"
         return result
+
 
     except Exception as e:
         logger.warning("Fragment check error for @%s: %s", username, e)
@@ -249,42 +211,40 @@ async def check_fragment(username: str) -> dict:
 
 # ── Полная проверка ────────────────────────────────────────────────────────────
 
-async def is_username_free(username: str, token: str) -> Tuple[bool, str, Optional[str], str]:
+async def is_username_free(username: str, token: str) -> Tuple[bool, str]:
     """
-    Возвращает (доступен, статус, цена_TON_или_None, fragment_url)
-    Статусы: 'free', 'taken_tg', 'on_sale', 'sold', 'unknown'
+    Возвращает (свободен: bool, статус: str).
+    Свободен только если: TG не нашёл И Fragment вернул 404.
     """
     tg = await check_telegram(username, token)
 
     if tg is False:
-        frag_url = f"https://fragment.com/username/{username.lower()}"
-        return False, "taken_tg", None, frag_url
+        return False, "taken_tg"
 
     frag = await check_fragment(username)
 
     if frag["status"] == "free":
-        return True, "free", None, frag["url"]
-    elif frag["status"] == "on_sale":
-        # Занят — требует покупки на Fragment, не считается свободным
-        return False, "on_sale", frag.get("price"), frag["url"]
-    elif frag["status"] == "sold":
-        return False, "sold", None, frag["url"]
-    else:
-        # Fragment недоступен — доверяем Telegram
+        return True, "free"
+
+    if frag["status"] == "unknown":
+        # Fragment недоступен — доверяем TG
         if tg is True:
-            return True, "free", None, frag["url"]
-        return False, "unknown", None, frag["url"]
+            return True, "free"
+        return False, "unknown"
+
+    # sold или любой другой — занят
+    return False, "taken"
 
 
 # ── Форматирование результата ──────────────────────────────────────────────────
 
 def build_result_text(found: List[tuple]) -> str:
-    """found: list of (name, score, fragment_url)"""
+    """found: list of (name, score)"""
     if not found:
         return "😔 Свободных не нашлось. Попробуй ещё раз!"
 
     lines = ["🎯 <b>Свободные юзернеймы:</b>\n"]
-    for i, (name, score, frag_url) in enumerate(found, 1):
+    for i, (name, score) in enumerate(found, 1):
         filled = round(score)
         bar    = "🟩" * filled + "⬜" * (10 - filled)
         lines.append(
@@ -308,9 +268,9 @@ async def run_search(
     found: List[tuple] = []
 
     async def check_and_add(name: str, score: float):
-        free, status, _price, frag_url = await is_username_free(name, token)
-        if free and status == "free":
-            found.append((name, score, frag_url))
+        free, status = await is_username_free(name, token)
+        if free:
+            found.append((name, score))
 
     async def update_progress(idx: int, total: int):
         if progress_msg and idx % 5 == 0:
@@ -362,11 +322,8 @@ async def run_search(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "👋 <b>Username Finder Bot</b>\n\n"
-        "Ищу красивые свободные юзернеймы.\n"
-        "Проверяю в <b>Telegram</b> и на <b>Fragment.com</b>.\n\n"
-        "📌 <b>Статусы:</b>\n"
-        "✅ свободен — бери прямо сейчас\n"
-        "💎 продаётся — купить за TON на Fragment\n"
+        "Ищу красивые свободные 5-буквенные юзернеймы.\n"
+        "Проверяю в Telegram и на Fragment — показываю только <b>реально свободные</b>.\n\n"
         "Скоринг учитывает:\n"
         "• Ритмичность (чередование C/V)\n"
         "• Мелодичность слогов\n\n"
