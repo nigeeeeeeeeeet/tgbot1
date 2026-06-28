@@ -273,10 +273,12 @@ async def is_username_free(username: str, token: str) -> Tuple[bool, str, Option
     if frag["status"] == "free":
         return True, "free", None, frag["url"]
     elif frag["status"] == "on_sale":
-        return True, "on_sale", frag.get("price"), frag["url"]
+        # Занят — требует покупки на Fragment, не считается свободным
+        return False, "on_sale", frag.get("price"), frag["url"]
     elif frag["status"] == "sold":
         return False, "sold", None, frag["url"]
     else:
+        # Fragment недоступен — доверяем Telegram
         if tg is True:
             return True, "free", None, frag["url"]
         return False, "unknown", None, frag["url"]
@@ -295,42 +297,46 @@ STATUS_LABELS = {
 def build_result_text(found: List[tuple]) -> str:
     """
     found: list of (name, score, status, price_or_None, fragment_url)
+    Свободные (free) — основной блок.
+    На продаже (on_sale) — бонусный блок внизу с чёткой пометкой.
     """
-    # Разделяем free и on_sale для наглядности
-    free_items   = [x for x in found if x[2] == "free"]
-    sale_items   = [x for x in found if x[2] == "on_sale"]
-    other_items  = [x for x in found if x[2] not in ("free", "on_sale")]
+    free_items = [x for x in found if x[2] == "free"]
+    sale_items = [x for x in found if x[2] == "on_sale"]
 
-    ordered = free_items + sale_items + other_items
-
-    lines = ["🎯 <b>Найденные юзернеймы:</b>\n"]
-
-    for i, item in enumerate(ordered, 1):
+    def render_item(i, item, prefix=""):
         name, score, status = item[0], item[1], item[2]
         price    = item[3] if len(item) > 3 else None
         frag_url = item[4] if len(item) > 4 else f"https://fragment.com/username/{name}"
-
-        filled = round(score)
-        bar    = "🟩" * filled + "⬜" * (10 - filled)
-        label  = STATUS_LABELS.get(status, "❓")
-
-        # Значок длины
+        filled   = round(score)
+        bar      = "🟩" * filled + "⬜" * (10 - filled)
+        label    = STATUS_LABELS.get(status, "❓")
         length_tag = "🔷" if len(name) == 4 else ""
-
-        price_str = f"\n   💰 Цена: <b>{price}</b>" if (status == "on_sale" and price) else ""
-
-        lines.append(
-            f"{i}. {length_tag}<code>@{name}</code> — {score}/10\n"
+        price_str  = f"\n   💰 Цена: <b>{price}</b>" if (status == "on_sale" and price) else ""
+        frag_link  = f'  |  <a href="{frag_url}">💎 Fragment</a>' if status == "on_sale" else ""
+        return (
+            f"{prefix}{i}. {length_tag}<code>@{name}</code> — {score}/10\n"
             f"   {bar}\n"
             f"   {label}{price_str}\n"
-            f"   <a href=\"https://t.me/{name}\">👉 Telegram</a>"
-            + (f"  |  <a href=\"{frag_url}\">💎 Fragment</a>" if status == "on_sale" else "")
+            f'   <a href="https://t.me/{name}">👉 Telegram</a>{frag_link}'
         )
 
-    # Подсказка про 4-буквенные
-    has_4 = any(len(x[0]) == 4 for x in ordered)
+    lines = []
+
+    if free_items:
+        lines.append("🎯 <b>Свободные юзернеймы:</b>\n")
+        for i, item in enumerate(free_items, 1):
+            lines.append(render_item(i, item))
+    else:
+        lines.append("😔 Свободных не нашлось в этот раз.")
+
+    if sale_items:
+        lines.append("\n💎 <b>Также на Fragment (нужна покупка за TON):</b>\n")
+        for i, item in enumerate(sale_items, 1):
+            lines.append(render_item(i, item, prefix="  "))
+
+    has_4 = any(len(x[0]) == 4 for x in free_items + sale_items)
     if has_4:
-        lines.append("\n🔷 — 4-буквенный (Fragment-премиум)")
+        lines.append("\n🔷 — 4-буквенный")
 
     return "\n\n".join(lines)
 
@@ -343,29 +349,38 @@ async def run_search(
     progress_msg=None,
 ) -> List[tuple]:
     """
-    Возвращает list of (name, score, status, price_or_None, fragment_url)
+    Возвращает list of (name, score, status, price_or_None, fragment_url).
+    Только status == 'free' считается найденным (реально свободным).
+    on_sale собирается отдельно и добавляется в конец как бонус (max 2 штуки).
     """
-    found: List[tuple] = []
+    found: List[tuple] = []      # только status == 'free'
+    on_sale: List[tuple] = []    # status == 'on_sale' — бонус
+
+    def add_result(name, score, status, price, frag_url):
+        if status == "free":
+            found.append((name, score, status, price, frag_url))
+        elif status == "on_sale" and len(on_sale) < 2:
+            on_sale.append((name, score, status, price, frag_url))
+
+    async def update_progress(idx: int, total: int):
+        if progress_msg and idx % 5 == 0:
+            try:
+                sale_str = f" | На продаже: {len(on_sale)}" if on_sale else ""
+                await progress_msg.edit_text(
+                    f"\u23f3 Проверено: {idx}/{total} | Свободных: {len(found)}/5{sale_str}"
+                )
+            except Exception:
+                pass
 
     if pattern_filter is None:
-        # Обычный поиск: микс 4- и 5-буквенных, топ по скору
         candidates = generate_candidates(300, include_4=True)
-        top = candidates[:60]
-
+        top = candidates[:70]
         for idx, (name, score) in enumerate(top, 1):
             if len(found) >= 5:
                 break
             free, status, price, frag_url = await is_username_free(name, token)
-            if free:
-                found.append((name, score, status, price, frag_url))
-            if progress_msg and idx % 5 == 0:
-                try:
-                    await progress_msg.edit_text(
-                        f"⏳ Проверено: {idx}/60 | Найдено: {len(found)}/5\n"
-                        f"(ищу 4–5 букв, сортирую по красоте)"
-                    )
-                except Exception:
-                    pass
+            add_result(name, score, status, price, frag_url)
+            await update_progress(idx, 70)
             await asyncio.sleep(0.5)
 
     elif pattern_filter == "cvcvc":
@@ -377,8 +392,7 @@ async def run_search(
             if score < 5.0:
                 continue
             free, status, price, frag_url = await is_username_free(name, token)
-            if free:
-                found.append((name, score, status, price, frag_url))
+            add_result(name, score, status, price, frag_url)
             await asyncio.sleep(0.5)
 
     elif pattern_filter == "end_vowel":
@@ -393,12 +407,10 @@ async def run_search(
             if score < 5.0:
                 continue
             free, status, price, frag_url = await is_username_free(name, token)
-            if free:
-                found.append((name, score, status, price, frag_url))
+            add_result(name, score, status, price, frag_url)
             await asyncio.sleep(0.5)
 
     elif pattern_filter == "short4":
-        # Только 4-буквенные (Fragment-премиум)
         attempts = 0
         while len(found) < 5 and attempts < 150:
             attempts += 1
@@ -407,11 +419,11 @@ async def run_search(
             if score < 5.5:
                 continue
             free, status, price, frag_url = await is_username_free(name, token)
-            if free:
-                found.append((name, score, status, price, frag_url))
+            add_result(name, score, status, price, frag_url)
             await asyncio.sleep(0.5)
 
-    return found
+    # Свободные первые, on_sale — бонус в конце
+    return found + on_sale
 
 
 # ── Хэндлеры ──────────────────────────────────────────────────────────────────
