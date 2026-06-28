@@ -17,7 +17,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Фонетика ──────────────────────────────────────────────────────────────────
 VOWELS    = list("aeiou")
 SOFT_CONS = list("bdfghjklmnrstvw")
 PATTERNS  = ["CVCVC", "VCVCV", "CVCCV", "CVCVV", "VCCVC"]
@@ -28,11 +27,6 @@ NICE_COMBOS = [
     "ro","lo","no","mo","de","re","le","ne",
 ]
 UGLY_COMBOS = ["xz","zx","qq","ww","vv","kk","jj","xx","ck","gn","mn"]
-
-
-def escape_md(text: str) -> str:
-    """Экранирует спецсимволы для MarkdownV2."""
-    return re.sub(r'([_*\[\]()~`>#+=|{}.!\\-])', r'\\\1', text)
 
 
 def generate_from_pattern(pattern: str) -> str:
@@ -48,29 +42,23 @@ def generate_from_pattern(pattern: str) -> str:
 def score_username(name: str) -> float:
     score = 5.0
     n = name.lower()
-
     if re.search(r"[bcdfghjklmnprstvwxyz]{3}", n):
         score -= 2.5
     if re.search(r"[aeiou]{3}", n):
         score -= 1.5
-
     alternations = sum(
         1 for i in range(len(n) - 1)
         if (n[i] in "aeiou") != (n[i + 1] in "aeiou")
     )
     score += alternations * 0.5
-
     if n[-1] in "aeiou":
         score += 0.5
-
     for combo in UGLY_COMBOS:
         if combo in n:
             score -= 1.5
-
     for combo in NICE_COMBOS:
         if combo in n:
             score += 0.4
-
     return round(min(max(score, 0.0), 10.0), 1)
 
 
@@ -85,40 +73,30 @@ def generate_candidates(count: int = 300) -> List[Tuple[str, float]]:
     return scored
 
 
-# ── Проверка через Telegram Bot API (getChat) ─────────────────────────────────
 async def check_username_available(username: str, token: str) -> Optional[bool]:
-    """
-    True  = юзернейм свободен
-    False = занят
-    None  = не удалось определить
-    """
     url = f"https://api.telegram.org/bot{token}/getChat"
     try:
         async with httpx.AsyncClient(timeout=6.0) as client:
             r = await client.post(url, json={"chat_id": f"@{username}"})
             data = r.json()
-            logger.info("getChat @%s → %s", username, data)
+            logger.info("getChat @%s -> ok=%s desc=%s", username, data.get("ok"), data.get("description",""))
             if data.get("ok"):
-                return False   # getChat успешен → юзернейм занят
+                return False  # нашли — занят
             err = data.get("description", "").lower()
-            # Telegram возвращает разные варианты для несуществующего юзернейма
-            free_phrases = ["not found", "chat not found", "invalid username", "no username"]
+            free_phrases = ["not found", "chat not found", "invalid username", "username not occupied"]
             if any(p in err for p in free_phrases):
-                return True    # юзернейм свободен
-            # 429 = флуд-лимит, ждём
+                return True   # не нашли — свободен
             if r.status_code == 429:
                 retry = int(r.headers.get("Retry-After", 3))
                 await asyncio.sleep(retry)
-                return None
             return None
     except Exception as e:
-        logger.warning("check_username_available error: %s", e)
+        logger.warning("check error: %s", e)
         return None
 
 
-# ── Построение текста результата ──────────────────────────────────────────────
-def build_result_text(found: List[Tuple], title: str) -> str:
-    lines = [f"🎯 *{escape_md(title)}*\n"]
+def build_result_text(found: List[tuple]) -> str:
+    lines = ["🎯 <b>Найденные свободные юзернеймы:</b>\n"]
     for i, item in enumerate(found, 1):
         name, score = item[0], item[1]
         confirmed = item[2] if len(item) > 2 else False
@@ -126,20 +104,19 @@ def build_result_text(found: List[Tuple], title: str) -> str:
         bar = "🟩" * filled + "⬜" * (10 - filled)
         status = "✅ свободен" if confirmed else "❓ возможно свободен"
         lines.append(
-            f"{i}\\. `@{name}` — {score}/10 {escape_md(status)}\n"
+            f"{i}. <code>@{name}</code> — {score}/10 {status}\n"
             f"   {bar}\n"
-            f"   👉 [Проверить](https://t\\.me/{name})"
+            f'   <a href="https://t.me/{name}">👉 Проверить в Telegram</a>'
         )
-    return "\n".join(lines)
+    return "\n\n".join(lines)
 
 
-# ── Поиск юзернеймов ──────────────────────────────────────────────────────────
 async def run_search(
     token: str,
     pattern_filter: Optional[str] = None,
     progress_msg=None,
-) -> List[Tuple]:
-    found: List[Tuple] = []
+) -> List[tuple]:
+    found: List[tuple] = []
 
     if pattern_filter is None:
         candidates = generate_candidates(300)
@@ -149,9 +126,9 @@ async def run_search(
                 break
             available = await check_username_available(name, token)
             if available is True:
-                found.append((name, score, True))   # подтверждённо свободен
+                found.append((name, score, True))
             elif available is None and score >= 7.0:
-                found.append((name, score, False))  # не проверен, но красивый
+                found.append((name, score, False))
             if progress_msg and idx % 5 == 0:
                 try:
                     await progress_msg.edit_text(
@@ -184,21 +161,20 @@ async def run_search(
     return found
 
 
-# ── Хэндлеры ──────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "👋 *Username Finder Bot*\n\n"
-        "Ищу красивые свободные 5\\-буквенные юзернеймы для Telegram\\.\n\n"
-        "📌 *Как работает оценка:*\n"
+        "👋 <b>Username Finder Bot</b>\n\n"
+        "Ищу красивые свободные 5-буквенные юзернеймы для Telegram.\n\n"
+        "📌 <b>Как работает оценка:</b>\n"
         "• Чередование гласных/согласных → плавно звучит\n"
-        "• Красивые слоги \\(la, ri, ma\\.\\.\\. \\) → легко выговаривать\n"
+        "• Красивые слоги (la, ri, ma...) → легко выговаривать\n"
         "• Штраф за три согласных подряд\n\n"
         "Жми кнопку ниже 👇"
     )
     keyboard = [[InlineKeyboardButton("🔍 Найти юзернеймы", callback_data="search")]]
     await update.message.reply_text(
         text,
-        parse_mode="MarkdownV2",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -208,13 +184,9 @@ async def search_usernames(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
     msg = await query.message.reply_text("⏳ Генерирую и проверяю доступность…")
 
-    token = context.bot.token
-    found = await run_search(token, progress_msg=msg)
+    found = await run_search(context.bot.token, progress_msg=msg)
 
-    if not found:
-        result = "😔 Не нашёл свободных\\. Попробуй ещё раз\\!"
-    else:
-        result = build_result_text(found, "Топ 5-буквенных юзернеймов:")
+    result = build_result_text(found) if found else "😔 Не нашёл свободных. Попробуй ещё раз!"
 
     keyboard = [
         [InlineKeyboardButton("🔄 Ещё варианты",      callback_data="search")],
@@ -224,18 +196,21 @@ async def search_usernames(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         await msg.edit_text(
             result,
-            parse_mode="MarkdownV2",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard),
             disable_web_page_preview=True,
         )
     except Exception as e:
-        logger.error("Не удалось отредактировать сообщение: %s", e)
-        await query.message.reply_text(
-            result,
-            parse_mode="MarkdownV2",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            disable_web_page_preview=True,
-        )
+        logger.error("edit_text error: %s", e)
+        try:
+            await query.message.reply_text(
+                result,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                disable_web_page_preview=True,
+            )
+        except Exception as e2:
+            logger.error("reply_text error: %s", e2)
 
 
 async def search_pattern(
@@ -247,14 +222,9 @@ async def search_pattern(
     await query.answer()
     msg = await query.message.reply_text("⏳ Ищу по паттерну…")
 
-    token = context.bot.token
-    found = await run_search(token, pattern_filter=pattern_filter)
+    found = await run_search(context.bot.token, pattern_filter=pattern_filter)
 
-    label = "CVCVC" if pattern_filter == "cvcvc" else "гласная в конце"
-    if not found:
-        result = "😔 Не нашёл свободных\\. Попробуй ещё раз\\!"
-    else:
-        result = build_result_text(found, f"Результат ({label}):")
+    result = build_result_text(found) if found else "😔 Не нашёл свободных. Попробуй ещё раз!"
 
     keyboard = [
         [InlineKeyboardButton("🔄 Ещё", callback_data=f"pattern_{pattern_filter}")],
@@ -263,12 +233,21 @@ async def search_pattern(
     try:
         await msg.edit_text(
             result,
-            parse_mode="MarkdownV2",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard),
             disable_web_page_preview=True,
         )
     except Exception as e:
-        logger.error("Не удалось отредактировать сообщение: %s", e)
+        logger.error("edit_text error: %s", e)
+        try:
+            await query.message.reply_text(
+                result,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                disable_web_page_preview=True,
+            )
+        except Exception as e2:
+            logger.error("reply_text error: %s", e2)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -283,13 +262,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.callback_query.answer("Неизвестная команда")
 
 
-# ── Запуск ────────────────────────────────────────────────────────────────────
 def main() -> None:
     if not BOT_TOKEN:
         raise ValueError(
             "BOT_TOKEN не задан!\n"
             "Локально: export BOT_TOKEN=твой_токен\n"
-            "Railway: добавь в Variables → BOT_TOKEN"
+            "Railway: добавь в Variables -> BOT_TOKEN"
         )
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
