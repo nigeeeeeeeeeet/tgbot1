@@ -97,25 +97,36 @@ async def check_username_available(username: str, token: str) -> Optional[bool]:
         async with httpx.AsyncClient(timeout=6.0) as client:
             r = await client.post(url, json={"chat_id": f"@{username}"})
             data = r.json()
+            logger.info("getChat @%s → %s", username, data)
             if data.get("ok"):
                 return False   # getChat успешен → юзернейм занят
-            err = data.get("description", "")
-            if "not found" in err.lower() or "chat not found" in err.lower():
-                return True    # Telegram говорит «не найден» → свободен
-            return None        # другая ошибка (флуд-лимит и т.п.)
+            err = data.get("description", "").lower()
+            # Telegram возвращает разные варианты для несуществующего юзернейма
+            free_phrases = ["not found", "chat not found", "invalid username", "no username"]
+            if any(p in err for p in free_phrases):
+                return True    # юзернейм свободен
+            # 429 = флуд-лимит, ждём
+            if r.status_code == 429:
+                retry = int(r.headers.get("Retry-After", 3))
+                await asyncio.sleep(retry)
+                return None
+            return None
     except Exception as e:
         logger.warning("check_username_available error: %s", e)
         return None
 
 
 # ── Построение текста результата ──────────────────────────────────────────────
-def build_result_text(found: List[Tuple[str, float]], title: str) -> str:
+def build_result_text(found: List[Tuple], title: str) -> str:
     lines = [f"🎯 *{escape_md(title)}*\n"]
-    for i, (name, score) in enumerate(found, 1):
+    for i, item in enumerate(found, 1):
+        name, score = item[0], item[1]
+        confirmed = item[2] if len(item) > 2 else False
         filled = round(score)
         bar = "🟩" * filled + "⬜" * (10 - filled)
+        status = "✅ свободен" if confirmed else "❓ возможно свободен"
         lines.append(
-            f"{i}\\. `@{name}` — {score}/10\n"
+            f"{i}\\. `@{name}` — {score}/10 {escape_md(status)}\n"
             f"   {bar}\n"
             f"   👉 [Проверить](https://t\\.me/{name})"
         )
@@ -127,8 +138,8 @@ async def run_search(
     token: str,
     pattern_filter: Optional[str] = None,
     progress_msg=None,
-) -> List[Tuple[str, float]]:
-    found: List[Tuple[str, float]] = []
+) -> List[Tuple]:
+    found: List[Tuple] = []
 
     if pattern_filter is None:
         candidates = generate_candidates(300)
@@ -138,10 +149,9 @@ async def run_search(
                 break
             available = await check_username_available(name, token)
             if available is True:
-                found.append((name, score))
+                found.append((name, score, True))   # подтверждённо свободен
             elif available is None and score >= 7.0:
-                # Не смогли проверить, но юзернейм красивый — показываем со знаком вопроса
-                found.append((name, score))
+                found.append((name, score, False))  # не проверен, но красивый
             if progress_msg and idx % 5 == 0:
                 try:
                     await progress_msg.edit_text(
@@ -165,8 +175,10 @@ async def run_search(
             if score < 5.0:
                 continue
             available = await check_username_available(name, token)
-            if available is True or (available is None and score >= 7.0):
-                found.append((name, score))
+            if available is True:
+                found.append((name, score, True))
+            elif available is None and score >= 7.0:
+                found.append((name, score, False))
             await asyncio.sleep(0.4)
 
     return found
